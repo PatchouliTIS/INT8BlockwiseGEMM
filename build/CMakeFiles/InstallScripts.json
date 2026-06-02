@@ -1,7 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/deploy/Int8MoE_Phase2/INT8HybridMoE/build/cmake_install.cmake"
-	],
-	"Parallel" : false
-}

@@ -14,7 +14,7 @@ All CUDA kernels are compiled from source into a single shared library (`libint8
 | PyTorch | 2.11.0+cu129 |
 | Triton | 3.6.0 |
 | CMake | 4.3.2 |
-| CUTLASS | 3.x (headers only) |
+| CUTLASS | v4.4.2 (included as git submodule) |
 | GPU | SM80 (A100 / A800 / etc.) |
 
 ---
@@ -24,11 +24,12 @@ All CUDA kernels are compiled from source into a single shared library (`libint8
 ```bash
 cd INT8HybridMoE
 
+# First time: initialize the CUTLASS submodule
+git submodule update --init --recursive
+
+# Build
 mkdir -p build && cd build
-
-# Point to CUTLASS headers (e.g. from vllm deps or a standalone checkout)
-cmake .. -DINT8HYBRID_CUTLASS_DIR=/deploy/vllm-abo/.deps/cutlass-src
-
+cmake ..
 make -j$(nproc)
 ```
 
@@ -38,8 +39,12 @@ On success, `build/libint8_hybrid_moe_ops.so` is produced.
 
 | Option | Default | Description |
 |---|---|---|
-| `INT8HYBRID_CUTLASS_DIR` | `/deploy/vllm-abo/.deps/cutlass-src` | Path to CUTLASS root (must contain `include/cutlass/cutlass.h`) |
+| `INT8HYBRID_CUTLASS_DIR` | `include/cutlass` (git submodule) | Path to CUTLASS root (must contain `include/cutlass/cutlass.h`) |
 | `INT8HYBRID_CUDA_ARCHS` | `80;89` | CUDA architectures to compile for |
+
+> **Note:** CUTLASS is managed as a git submodule pinned to **v4.4.2** at `include/cutlass/`.
+> If you need to use a different CUTLASS version, either update the submodule or pass
+> `-DINT8HYBRID_CUTLASS_DIR=/path/to/cutlass` to cmake.
 
 ---
 
@@ -125,6 +130,7 @@ INT8HybridMoE/
 │       └── moe_permute_unpermute_kernel.inl
 │
 ├── include/                                # Header files
+│   ├── cutlass/                            #   CUTLASS v4.4.2 (git submodule)
 │   ├── cuda_compat.h                       #   CUDA/ROCm compatibility macros
 │   ├── cuda_vec_utils.cuh                  #   Vectorized load/store utilities
 │   ├── dispatch_utils.h                    #   Type dispatch macros
@@ -133,6 +139,9 @@ INT8HybridMoE/
 │   ├── int8_grouped_gemm.h                #   INT8 grouped GEMM declarations
 │   ├── int8_hybrid_common.h               #   Hybrid GEMM common definitions
 │   └── int8_hybrid_grouped_gemm.h         #   Hybrid grouped GEMM declarations
+│
+├── .gitmodules                             # Git submodule configuration
+├── .gitignore                              # Build artifacts exclusion
 │
 └── build/                                  # Build output (generated)
     └── libint8_hybrid_moe_ops.so           #   Compiled shared library
