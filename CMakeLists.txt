@@ -38,8 +38,8 @@ if(NOT DEFINED INT8HYBRID_CUTLASS_DIR)
   if(DEFINED ENV{CUTLASS_DIR})
     set(INT8HYBRID_CUTLASS_DIR "$ENV{CUTLASS_DIR}")
   else()
-    # Try the vllm-abo deps location
-    set(INT8HYBRID_CUTLASS_DIR "/deploy/vllm-abo/.deps/cutlass-src")
+    # Default: use the git submodule at include/cutlass
+    set(INT8HYBRID_CUTLASS_DIR "${CMAKE_SOURCE_DIR}/include/cutlass")
   endif()
 endif()
 
