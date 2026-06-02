@@ -1,0 +1,3 @@
+/deploy/Int8MoE_Phase2/INT8HybridMoE/build/CMakeFiles/int8_hybrid_moe_ops.dir
+/deploy/Int8MoE_Phase2/INT8HybridMoE/build/CMakeFiles/edit_cache.dir
+/deploy/Int8MoE_Phase2/INT8HybridMoE/build/CMakeFiles/rebuild_cache.dir

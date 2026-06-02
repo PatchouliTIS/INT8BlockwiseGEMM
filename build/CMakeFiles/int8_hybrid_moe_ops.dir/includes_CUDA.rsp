@@ -1,0 +1,1 @@
+-I/deploy/Int8MoE_Phase2/INT8HybridMoE/include -I/deploy/Int8MoE_Phase2/INT8HybridMoE/csrc -I"/deploy/vllm-abo/.deps/cutlass-src/include" -isystem "/usr/local/lib/python3.12/dist-packages/torch/include" -isystem "/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include" -isystem /usr/local/cuda/include
