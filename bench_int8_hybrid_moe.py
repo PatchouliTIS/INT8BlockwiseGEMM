@@ -1,27 +1,37 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Standalone INT8-hybrid MoE benchmark (no vllm dependency).
+"""Standalone INT8-hybrid MoE benchmark.
 
-Benchmarks the CUTLASS SM80 INT8 hybrid grouped MoE kernel using only:
-  - Pre-built vllm .so libraries (loaded via torch.ops.load_library)
-  - Triton kernels for activation quantization
-  - Minimal Python wrappers (no vllm Python package)
+Three backends are compared on the same problem shape:
+
+1. ``unquantized``           -- vllm TritonExperts with no quantization (baseline).
+2. ``cutlass_int8_hybrid``   -- Standalone CUTLASS SM80 INT8 hybrid grouped MoE
+                                kernel (compiled from this project's .so).
+3. ``triton_int8_blockwise`` -- vllm TritonExperts with blockwise INT8 W8A8.
+
+The cutlass_int8_hybrid backend uses the locally compiled .so library and does
+NOT depend on vllm. The other two backends import from vllm directly.
 
 Typical usage::
 
-    # Plain timing
+    # Run all backends
     python bench_int8_hybrid_moe.py \\
         --num-tokens 1024 --hidden 4096 --intermediate 1408 \\
         --num-experts 64 --top-k 8
 
+    # Run only the cutlass backend (no vllm dependency)
+    python bench_int8_hybrid_moe.py --backend cutlass_int8_hybrid
+
     # nsys profile (only the first profiled iteration is captured)
     nsys profile -c cudaProfilerApi -t cuda,nvtx --force-overwrite=true \\
-        -o moe_cutlass python bench_int8_hybrid_moe.py --profile
+        -o moe_cutlass python bench_int8_hybrid_moe.py \\
+        --backend cutlass_int8_hybrid --profile
 
     # ncu profile (one kernel launch only)
     ncu --set full --target-processes all \\
         --profile-from-start off \\
-        -o moe_cutlass python bench_int8_hybrid_moe.py --profile
+        -o moe_cutlass python bench_int8_hybrid_moe.py \\
+        --backend cutlass_int8_hybrid --profile
 """
 
 from __future__ import annotations
@@ -111,10 +121,83 @@ def _quantize_blockwise_int8(
 
 
 # ---------------------------------------------------------------------------
-# Backend runner
+# Backend runners
 # ---------------------------------------------------------------------------
-class CutlassInt8HybridRunner:
-    """Runs the SM80 CUTLASS INT8 hybrid grouped MoE kernel directly."""
+class BackendRunner:
+    """Base class: captures pre-built tensors and exposes a no-arg run()."""
+
+    name: str
+
+    def run(self) -> None:
+        raise NotImplementedError
+
+
+class UnquantizedTritonRunner(BackendRunner):
+    """Runs vllm's TritonExperts with the unquantized config (baseline)."""
+
+    name = "unquantized"
+
+    def __init__(self, shape: ProblemShape, device: torch.device):
+        from vllm.model_executor.layers.fused_moe.activation import (
+            MoEActivation as VllmMoEActivation,
+        )
+        from vllm.model_executor.layers.fused_moe.config import (
+            FUSED_MOE_UNQUANTIZED_CONFIG,
+        )
+        from vllm.model_executor.layers.fused_moe.fused_moe import TritonExperts
+
+        self._vllm_activation = VllmMoEActivation.SILU
+
+        moe_config = _make_vllm_moe_config(shape, device)
+        self.experts = TritonExperts(
+            moe_config=moe_config,
+            quant_config=FUSED_MOE_UNQUANTIZED_CONFIG,
+        )
+
+        E = shape.num_experts
+        N = shape.intermediate
+        K = shape.hidden
+        M = shape.num_tokens
+        topk = shape.top_k
+        dtype = shape.dtype
+
+        self.hidden = torch.randn(M, K, device=device, dtype=dtype)
+        self.w13 = torch.randn(E, 2 * N, K, device=device, dtype=dtype) * 0.02
+        self.w2 = torch.randn(E, K, N, device=device, dtype=dtype) * 0.02
+        self.topk_weights, self.topk_ids = _build_routing(M, E, topk, device)
+
+        ws1, ws2, out = self.experts.workspace_shapes(
+            M=M, N=N, K=K, topk=topk,
+            global_num_experts=E, local_num_experts=E,
+            expert_tokens_meta=None,
+            activation=self._vllm_activation,
+        )
+        self.workspace13 = torch.empty(ws1, device=device, dtype=dtype)
+        self.workspace2 = torch.empty(ws2, device=device, dtype=dtype)
+        self.output = torch.empty(out, device=device, dtype=dtype)
+
+    def run(self) -> None:
+        self.experts.apply(
+            output=self.output,
+            hidden_states=self.hidden,
+            w1=self.w13,
+            w2=self.w2,
+            topk_weights=self.topk_weights,
+            topk_ids=self.topk_ids,
+            activation=self._vllm_activation,
+            global_num_experts=self.w13.size(0),
+            expert_map=None,
+            a1q_scale=None,
+            a2_scale=None,
+            workspace13=self.workspace13,
+            workspace2=self.workspace2,
+            expert_tokens_meta=None,
+            apply_router_weight_on_input=False,
+        )
+
+
+class CutlassInt8HybridRunner(BackendRunner):
+    """Runs the standalone SM80 CUTLASS INT8 hybrid grouped MoE kernel."""
 
     name = "cutlass_int8_hybrid"
 
@@ -192,10 +275,144 @@ class CutlassInt8HybridRunner:
         )
 
 
+class TritonInt8BlockwiseRunner(BackendRunner):
+    """Runs vllm's TritonExperts on the blockwise INT8 W8A8 path."""
+
+    name = "triton_int8_blockwise"
+
+    def __init__(self, shape: ProblemShape, device: torch.device,
+                 quant_block_size: int):
+        from vllm.model_executor.layers.fused_moe.activation import (
+            MoEActivation as VllmMoEActivation,
+        )
+        from vllm.model_executor.layers.fused_moe.config import (
+            FusedMoEQuantConfig,
+        )
+        from vllm.model_executor.layers.fused_moe.fused_moe import TritonExperts
+        from vllm.model_executor.layers.fused_moe.utils import (
+            moe_kernel_quantize_input,
+        )
+
+        self._vllm_activation = VllmMoEActivation.SILU
+
+        E = shape.num_experts
+        N = shape.intermediate
+        K = shape.hidden
+        M = shape.num_tokens
+        topk = shape.top_k
+        dtype = shape.dtype
+
+        block_n = 64        # block_shape[0]
+        block_k = quant_block_size
+        block_shape = [block_n, block_k]
+
+        # Pre-quantize the input activation (simulates the modular prepare stage)
+        hidden = torch.randn(M, K, device=device, dtype=dtype)
+        self.hidden, self.a1q_scale = moe_kernel_quantize_input(
+            hidden,
+            None,
+            torch.int8,
+            False,
+            block_shape,
+        )
+
+        w13_bf16 = torch.randn(E, 2 * N, K, device=device, dtype=dtype) * 0.02
+        w2_bf16 = torch.randn(E, K, N, device=device, dtype=dtype) * 0.02
+        self.w13, w13_scale = _quantize_blockwise_int8(w13_bf16, block_n, block_k)
+        self.w2, w2_scale = _quantize_blockwise_int8(w2_bf16, block_n, block_k)
+        self.topk_weights, self.topk_ids = _build_routing(M, E, topk, device)
+
+        moe_config = _make_vllm_moe_config(shape, device)
+
+        quant_config = FusedMoEQuantConfig.make(
+            torch.int8,
+            w1_scale=w13_scale,
+            w2_scale=w2_scale,
+            per_act_token_quant=False,
+            per_out_ch_quant=False,
+            block_shape=block_shape,
+        )
+
+        self.experts = TritonExperts(
+            moe_config=moe_config,
+            quant_config=quant_config,
+        )
+
+        ws1, ws2, out = self.experts.workspace_shapes(
+            M=M, N=N, K=K, topk=topk,
+            global_num_experts=E, local_num_experts=E,
+            expert_tokens_meta=None,
+            activation=self._vllm_activation,
+        )
+        self.workspace13 = torch.empty(ws1, device=device, dtype=dtype)
+        self.workspace2 = torch.empty(ws2, device=device, dtype=dtype)
+        self.output = torch.empty(out, device=device, dtype=dtype)
+
+    def run(self) -> None:
+        self.experts.apply(
+            output=self.output,
+            hidden_states=self.hidden,
+            w1=self.w13,
+            w2=self.w2,
+            topk_weights=self.topk_weights,
+            topk_ids=self.topk_ids,
+            activation=self._vllm_activation,
+            global_num_experts=self.w13.size(0),
+            expert_map=None,
+            a1q_scale=self.a1q_scale,
+            a2_scale=None,
+            workspace13=self.workspace13,
+            workspace2=self.workspace2,
+            expert_tokens_meta=None,
+            apply_router_weight_on_input=False,
+        )
+
+
+# ---------------------------------------------------------------------------
+# vllm FusedMoEConfig builder (single GPU, no real distributed groups)
+# ---------------------------------------------------------------------------
+def _make_vllm_moe_config(shape: ProblemShape, device: torch.device):
+    """Build a vllm FusedMoEConfig for the given problem shape."""
+    from vllm.model_executor.layers.fused_moe.config import (
+        FusedMoEConfig,
+        FusedMoEParallelConfig,
+        RoutingMethodType,
+    )
+    from vllm.model_executor.layers.fused_moe.activation import (
+        MoEActivation as VllmMoEActivation,
+    )
+
+    parallel_cfg = FusedMoEParallelConfig(
+        tp_size=1, pcp_size=1, dp_size=1, ep_size=1,
+        tp_rank=0, pcp_rank=0, dp_rank=0, ep_rank=0, sp_size=1,
+        use_ep=False,
+        all2all_backend="allgather_reducescatter",
+        enable_eplb=False,
+    )
+    return FusedMoEConfig(
+        num_experts=shape.num_experts,
+        experts_per_token=shape.top_k,
+        hidden_dim=shape.hidden,
+        intermediate_size_per_partition=shape.intermediate,
+        num_local_experts=shape.num_experts,
+        num_logical_experts=shape.num_experts,
+        activation=VllmMoEActivation.SILU,
+        device=device,
+        routing_method=RoutingMethodType.Renormalize,
+        moe_parallel_config=parallel_cfg,
+        in_dtype=shape.dtype,
+        max_num_tokens=max(shape.num_tokens, 1),
+        has_bias=False,
+        is_act_and_mul=True,
+        is_lora_enabled=False,
+        disable_inplace=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Benchmark loop
 # ---------------------------------------------------------------------------
-def benchmark(runner: CutlassInt8HybridRunner, warmup: int, iters: int,
+def benchmark(runner: BackendRunner, warmup: int, iters: int,
               profile: bool) -> dict[str, float]:
     # Warmup
     for _ in range(warmup):
@@ -242,16 +459,17 @@ DEFAULT_SUPER_GROUP_SIZE = 256
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Standalone INT8-hybrid MoE benchmark (no vllm)")
+        description="INT8-hybrid MoE benchmark (cutlass_int8_hybrid is "
+                    "standalone; unquantized/triton_int8_blockwise use vllm)")
 
     # Problem shape
-    p.add_argument("--num-tokens", type=int, default=1024,
+    p.add_argument("--num-tokens", type=int, default=8192,
                    help="Number of input tokens (M).")
-    p.add_argument("--hidden", type=int, default=4096,
+    p.add_argument("--hidden", type=int, default=2048,
                    help="Hidden size (K).")
-    p.add_argument("--intermediate", type=int, default=1408,
+    p.add_argument("--intermediate", type=int, default=512,
                    help="Per-expert intermediate size (N).")
-    p.add_argument("--num-experts", type=int, default=64,
+    p.add_argument("--num-experts", type=int, default=256,
                    help="Number of experts.")
     p.add_argument("--top-k", type=int, default=8,
                    help="Top-k experts per token.")
@@ -270,6 +488,13 @@ def parse_args() -> argparse.Namespace:
                    help="Max abs value for INT32 Q scales.")
 
     # Bench loop
+    p.add_argument("--backend",
+                   choices=["unquantized",
+                            "cutlass_int8_hybrid",
+                            "triton_int8_blockwise",
+                            "all"],
+                   default="all",
+                   help="Which backend(s) to benchmark.")
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iters", type=int, default=50)
     p.add_argument("--profile", action="store_true",
@@ -309,21 +534,43 @@ def main() -> None:
           f"fused_permute_quant_w1="
           f"{os.environ.get('VLLM_INT8_HYBRID_FUSED_PERMUTE_QUANT', '0')}")
 
-    runner = CutlassInt8HybridRunner(
-        shape, device,
-        quant_block_size=args.quant_block_size,
-        super_group_size=args.super_group_size,
-        q_max=args.q_max,
-    )
+    backends = (["unquantized", "cutlass_int8_hybrid",
+                 "triton_int8_blockwise"]
+                if args.backend == "all" else [args.backend])
 
-    stats = benchmark(runner, warmup=args.warmup, iters=args.iters,
-                      profile=args.profile)
-    print(f"[bench] backend={runner.name:>22s} "
-          f"min={stats['min_ms']:.3f} ms  "
-          f"median={stats['median_ms']:.3f} ms  "
-          f"mean={stats['mean_ms']:.3f} ms  "
-          f"p90={stats['p90_ms']:.3f} ms  "
-          f"max={stats['max_ms']:.3f} ms")
+    # When profiling, only allow a single backend per process so the nsys/ncu
+    # range covers exactly one kernel launch.
+    if args.profile and len(backends) > 1:
+        raise SystemExit(
+            "--profile requires a single --backend so the cudaProfilerApi "
+            "range covers exactly one kernel launch.")
+
+    for name in backends:
+        if name == "unquantized":
+            runner: BackendRunner = UnquantizedTritonRunner(shape, device)
+        elif name == "cutlass_int8_hybrid":
+            runner = CutlassInt8HybridRunner(
+                shape, device,
+                quant_block_size=args.quant_block_size,
+                super_group_size=args.super_group_size,
+                q_max=args.q_max,
+            )
+        elif name == "triton_int8_blockwise":
+            runner = TritonInt8BlockwiseRunner(
+                shape, device,
+                quant_block_size=args.quant_block_size,
+            )
+        else:
+            raise ValueError(f"unknown backend {name}")
+
+        stats = benchmark(runner, warmup=args.warmup, iters=args.iters,
+                          profile=args.profile)
+        print(f"[bench] backend={runner.name:>22s} "
+              f"min={stats['min_ms']:.3f} ms  "
+              f"median={stats['median_ms']:.3f} ms  "
+              f"mean={stats['mean_ms']:.3f} ms  "
+              f"p90={stats['p90_ms']:.3f} ms  "
+              f"max={stats['max_ms']:.3f} ms")
 
 
 if __name__ == "__main__":

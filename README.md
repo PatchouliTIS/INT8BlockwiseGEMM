@@ -14,7 +14,7 @@ All CUDA kernels are compiled from source into a single shared library (`libint8
 | PyTorch | 2.11.0+cu129 |
 | Triton | 3.6.0 |
 | CMake | 4.3.2 |
-| CUTLASS | v4.4.2 (included as git submodule) |
+| CUTLASS | v4.4.2 |
 | GPU | SM80 (A100 / A800 / etc.) |
 
 ---
@@ -22,7 +22,7 @@ All CUDA kernels are compiled from source into a single shared library (`libint8
 ## Build
 
 ```bash
-cd INT8HybridMoE
+cd INT8BlockwiseGEMM
 
 # First time: initialize the CUTLASS submodule
 git submodule update --init --recursive
@@ -53,7 +53,7 @@ On success, `build/libint8_hybrid_moe_ops.so` is produced.
 ```bash
 cd /deploy/Int8MoE_Phase2/INT8HybridMoE
 
-# Default shape (M=1024, K=4096, N=1408, E=64, top_k=8)
+# Default shape (M=8192, K=2048, N=512, E=256, top_k=8) Qwen3.6-35B-A3B workload
 python3 bench_int8_hybrid_moe.py
 
 # Custom shape
@@ -87,10 +87,10 @@ ncu --set full --target-processes all --profile-from-start off \
 
 | Argument | Default | Description |
 |---|---|---|
-| `--num-tokens` | 1024 | Number of input tokens (M) |
-| `--hidden` | 4096 | Hidden size (K) |
-| `--intermediate` | 1408 | Per-expert intermediate size (N) |
-| `--num-experts` | 64 | Number of experts |
+| `--num-tokens` | 8192 | Number of input tokens (M) |
+| `--hidden` | 2048 | Hidden size (K) |
+| `--intermediate` | 512 | Per-expert intermediate size (N) |
+| `--num-experts` | 256 | Number of experts |
 | `--top-k` | 8 | Top-k experts per token |
 | `--dtype` | `bfloat16` | Activation dtype (`bfloat16` or `float16`) |
 | `--quant-block-size` | 128 | Block size along K for INT8 quantization |
